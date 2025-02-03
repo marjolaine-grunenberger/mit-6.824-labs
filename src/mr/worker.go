@@ -4,15 +4,25 @@ import "fmt"
 import "log"
 import "net/rpc"
 import "hash/fnv"
+import "os"
+import "io/ioutil"
+import "sort"
+import "bufio"
+import "strings"
 
-
-//
-// Map functions return a slice of KeyValue.
-//
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -26,45 +36,136 @@ func ihash(key string) int {
 
 
 //
-// main/mrworker.go calls this function.
+// main/mrworker.go calls this function
 //
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
+func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
 
-	// Your worker implementation here.
+	for true {
+		reply := CallGetTask(mapf, reducef)
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		if reply.TaskType == "map" {
+			Map(mapf, reply.Task.FileName, reply.Task.FileId)
+			// Mark this task as completed
+			// Reduce will be called on all combination FiledId - NReduce
+			args := MapTaskDoneArgs{reply.Task.FileId}
+			reply := GetTaskReply{}
+			call("Coordinator.MapTaskDone", &args, &reply)
 
+		} else if reply.TaskType == "reduce" {
+			Reduce(reducef, reply.Task.ReducePartition, reply.Task.NMap)
+			// Mark this task as completed
+			args := ReduceTaskDoneArgs{reply.Task.ReducePartition}
+			reply := GetTaskReply{}
+			call("Coordinator.ReduceTaskDone", &args, &reply)
+		}
+
+	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+func Map(mapf func(string, string) []KeyValue, filename string, fileId int) {
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("Cannot open %v", filename)
 	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("Cannot read %v", filename)
+	}
+	file.Close()
+	intermediate := mapf(filename, string(content))
+
+	files := make(map[int]*os.File)
+	defer func() {
+		for _, file := range files {
+			file.Close()
+		}
+	}()
+
+	// Iterate over intermediate key value pairs
+	for _, kv := range intermediate {
+		// get the reduce task partition using ihash method over the key
+		reduceTaskPartition := ihash(kv.Key) % 10 // assuming NReduce is 10
+
+		// open the file for the reduce task partition if not already opened
+		if _, ok := files[reduceTaskPartition]; !ok {
+			fileName := fmt.Sprintf("mr-%d-%d", fileId, reduceTaskPartition)
+			files[reduceTaskPartition], err = os.Create(fileName)
+			if err != nil {
+				log.Fatalf("Cannot create %v", fileName)
+			}
+		}
+
+		// append key and value to the file
+		fmt.Fprintf(files[reduceTaskPartition], "%v %v\n", kv.Key, kv.Value)
+	}
+}
+
+func Reduce(reducef func(string, []string) string, reduceTaskPartition int, nMap int) {
+
+	// read all intermediate files, if they exist, for this reduce task partition
+	// some files might not exist, if no key are in the corresponding partition
+	intermediate := []KeyValue{}
+	for i := 0; i < nMap; i++ {
+        fileName := fmt.Sprintf("mr-%d-%d", i, reduceTaskPartition)
+        file, err := os.Open(fileName)
+        if err != nil {
+            if os.IsNotExist(err) {
+                continue
+            }       
+			log.Fatalf("Cannot open %v: %v", fileName, err) 
+		}
+        defer file.Close()
+
+        scanner := bufio.NewScanner(file)
+        for scanner.Scan() {
+            line := scanner.Text()
+            parts := strings.Split(line, " ")
+            if len(parts) != 2 {
+                log.Fatalf("Unexpected line format: %v", line)
+            }
+            intermediate = append(intermediate, KeyValue{Key: parts[0], Value: parts[1]})
+        }
+        if err := scanner.Err(); err != nil {
+            log.Fatalf("Error reading file %v: %v", fileName, err)
+        }
+    }
+
+	sort.Sort(ByKey(intermediate))
+
+	// create a temporary file for the reduce task partition
+	// mr-out-* files are the final output files, they are to be used by the user program,
+	// as another MapReduce job for instance
+	fileName := fmt.Sprintf("mr-out-%d", reduceTaskPartition)
+	ofile, _ := os.Create(fileName)
+
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-* for each partition
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+}	
+
+
+func CallGetTask(mapf func(string, string) []KeyValue, reducef func(string, []string) string) GetTaskReply {
+	args := GetTaskArgs{}
+	reply := GetTaskReply{}
+	call("Coordinator.GetTask", &args, &reply)
+	return reply
 }
 
 //
